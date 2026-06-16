@@ -1,7 +1,7 @@
 use core::convert::Infallible;
 
 use defmt::{debug, info};
-use embassy_stm32::eth::{Instance, PtpClock as EthPtpClock};
+use embassy_stm32::eth::{Instance, PtpClock as EthPtpClock, PtpTimeProvider};
 use statime::{
     Clock as StatimeClock,
     config::TimePropertiesDS,
@@ -25,6 +25,11 @@ impl<T: Instance> PtpClock<T> {
 
     pub fn inner(&self) -> &EthPtpClock<T> {
         &self.inner
+    }
+
+    /// Return a read-only provider for the MAC PTP time.
+    pub fn time_provider(&self) -> PtpTimeProvider<T> {
+        self.inner.time_provider()
     }
 }
 

@@ -17,7 +17,7 @@ use embassy_net::{
     IpAddress, IpEndpoint, Ipv4Address, Stack, TryError, udp,
     udp::{UdpMetadata, UdpSocket},
 };
-use embassy_stm32::eth::{Instance, PtpTimestamp, PtpTimestampStore as EthPtpTimestampStore};
+use embassy_stm32::eth::{Instance, PtpTimestampStore as EthPtpTimestampStore};
 use embassy_time::{Duration as EmbassyDuration, Instant, with_deadline};
 use rand_core::SeedableRng;
 use rand_xorshift::XorShiftRng;
@@ -33,6 +33,7 @@ use statime::{
 };
 
 pub use clock::PtpClock;
+pub use embassy_stm32::eth::{PtpTimeProvider, PtpTimestamp};
 use log::{ServoLog, state_name};
 pub use storage::PtpStorage;
 
