@@ -15,6 +15,7 @@ type EventStorage =
 type GeneralStorage =
     SocketStorage<GENERAL_RX_PACKETS, GENERAL_TX_PACKETS, GENERAL_RX_BYTES, GENERAL_TX_BYTES>;
 
+/// Static packet and socket storage for one [`crate::Runner`].
 pub struct PtpStorage {
     pub(super) event: EventStorage,
     pub(super) general: GeneralStorage,
@@ -22,6 +23,7 @@ pub struct PtpStorage {
 }
 
 impl PtpStorage {
+    /// Create empty PTP socket storage.
     pub const fn new() -> Self {
         Self {
             event: SocketStorage::new(),

@@ -1,5 +1,6 @@
 #![no_std]
 #![doc = include_str!("../README.md")]
+#![warn(missing_docs)]
 
 mod clock;
 mod log;
@@ -47,6 +48,8 @@ const MSG_DELAY_REQ: u8 = 0x1;
 const MSG_PDELAY_REQ: u8 = 0x2;
 const MSG_PDELAY_RESP: u8 = 0x3;
 
+/// Configuration for one PTP ordinary-clock runner.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Config {
     /// Ethernet MAC address used to derive the PTP clock identity.
@@ -82,6 +85,10 @@ pub struct Config {
 }
 
 impl Config {
+    /// Create a slave-only ordinary-clock configuration for `mac_address`.
+    ///
+    /// The MAC address defines the clock identity and `rng_seed` seeds
+    /// statime's per-port random scheduling.
     pub fn new(mac_address: [u8; 6], rng_seed: u64) -> Self {
         Self {
             mac_address,

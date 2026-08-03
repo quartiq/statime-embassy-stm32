@@ -9,11 +9,13 @@ use statime::{
 };
 
 #[derive(Debug)]
+/// Statime clock backed by the STM32 Ethernet MAC PTP clock.
 pub struct PtpClock<T: Instance> {
     inner: EthPtpClock<T>,
 }
 
 impl<T: Instance> PtpClock<T> {
+    /// Wrap an initialized Embassy Ethernet PTP clock.
     pub fn new(inner: EthPtpClock<T>) -> Self {
         info!(
             "ptp: clock increment={=u8}ns addend={=u32:#010x}",
@@ -23,6 +25,7 @@ impl<T: Instance> PtpClock<T> {
         Self { inner }
     }
 
+    /// Borrow the underlying Embassy Ethernet PTP clock.
     pub fn inner(&self) -> &EthPtpClock<T> {
         &self.inner
     }
