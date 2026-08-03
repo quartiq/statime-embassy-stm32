@@ -3,14 +3,22 @@
 
 use core::mem::MaybeUninit;
 
-use embassy_net::StackResources;
+use defmt::unwrap;
+use embassy_executor::Spawner;
+use embassy_net::{Config as NetConfig, StackResources};
 use embassy_stm32::{
     bind_interrupts,
-    eth::{Ethernet, GenericPhy, InterruptHandler, PacketQueue, Sma},
+    eth::{Ethernet, GenericPhy, InterruptHandler, PacketQueue, PtpClockConfig, Sma},
     peripherals::{ETH, ETH_SMA},
+};
+use embassy_stm32::{
+    interrupt::{InterruptExt as _, Priority},
+    pac::{self, Interrupt},
 };
 use static_cell::StaticCell;
 use statime_embassy_stm32::PtpTimestampStore;
+use statime_embassy_stm32::{Config as PtpConfig, PtpClock, PtpStorage, Runner as PtpRunner};
+
 use {defmt_rtt as _, panic_probe as _};
 
 defmt::timestamp!("{=u64:us}", embassy_time::Instant::now().as_micros());
@@ -27,13 +35,14 @@ const STACK_SOCKETS: usize = 4;
 type Driver = Ethernet<'static, ETH, GenericPhy<Sma<'static, ETH_SMA>>>;
 
 bind_interrupts!(struct Irqs {
-    ETH => InterruptHandler;
+    ETH => InterruptHandler<ETH>;
 });
 
 #[unsafe(link_section = ".sram3.eth")]
 static mut PACKETS: MaybeUninit<PacketQueue<ETH_TX_PACKETS, ETH_RX_PACKETS>> =
     MaybeUninit::uninit();
 static PTP_TIMESTAMPS: PtpTimestampStore = PtpTimestampStore::new();
+static PTP_STORAGE: StaticCell<PtpStorage> = StaticCell::new();
 static STACK_RESOURCES: StaticCell<StackResources<STACK_SOCKETS>> = StaticCell::new();
 
 pub mod board {
@@ -78,107 +87,78 @@ pub mod board {
     }
 }
 
-#[rtic::app(
-    device = embassy_stm32,
-    dispatchers = [DCMI, JPEG, LTDC, FDCAN_CAL]
-)]
-mod app {
-    use embassy_net::{Config as NetConfig, StackResources};
-    use embassy_stm32::{
-        eth::{Ethernet, GenericPhy, PacketQueue, PtpClockConfig, Sma},
-        interrupt::{InterruptExt as _, Priority},
-        pac::{self, Interrupt},
-        peripherals::ETH,
+#[embassy_executor::main]
+async fn main(spawner: Spawner) -> ! {
+    let p = embassy_stm32::init(board::stm32_config());
+
+    // Ethernet DMA buffers are placed in SRAM3 by this example linker
+    // script, so enable that RAM before initializing the packet queue.
+    pac::RCC.ahb2enr().modify(|w| w.set_sram3en(true));
+
+    // Keep hardware IRQs below the RTIC async software task priority. ETH
+    // wakes the network runner; TIM12 drives embassy-time deadlines.
+    Interrupt::ETH.set_priority(Priority::P6);
+    Interrupt::TIM8_BRK_TIM12.set_priority(Priority::P7);
+
+    #[cfg(feature = "stabilizer")]
+    {
+        use embassy_stm32::gpio::{Level, Output, Speed};
+        const SYSCLK_HZ: u32 = 400_000_000;
+
+        let mut phy_reset = Output::new(p.PE3, Level::Low, Speed::Low);
+        phy_reset.set_low();
+        cortex_m::asm::delay(SYSCLK_HZ / 4);
+        phy_reset.set_high();
+        cortex_m::asm::delay(SYSCLK_HZ / 4);
+        core::mem::forget(phy_reset);
+    }
+
+    let queue = unsafe {
+        let packets = core::ptr::addr_of_mut!(PACKETS);
+        PacketQueue::init_with_ptp(&mut *packets, &PTP_TIMESTAMPS);
+        (*packets).assume_init_mut()
     };
-    use statime_embassy_stm32::{Config as PtpConfig, PtpClock, PtpStorage, Runner as PtpRunner};
+    let phy = GenericPhy::new(Sma::new(p.ETH_SMA, p.PA2, p.PC1), 0);
+    let mut driver = Ethernet::new_with_phy(
+        queue,
+        p.ETH,
+        Irqs,
+        p.PA1,
+        p.PA7,
+        p.PC4,
+        p.PC5,
+        p.PB12,
+        p.PG14,
+        p.PB11,
+        board::MAC_ADDRESS,
+        phy,
+    );
+    let ptp_clock = PtpClock::new(driver.start_ptp(PtpClockConfig::default()));
+    let (stack, runner) = embassy_net::new(
+        driver,
+        NetConfig::dhcpv4(Default::default()),
+        STACK_RESOURCES.init(StackResources::new()),
+        board::SEED,
+    );
+    let ptp = PtpRunner::new(
+        stack,
+        ptp_clock,
+        PTP_STORAGE.init(PtpStorage::new()),
+        &PTP_TIMESTAMPS,
+        PtpConfig::new(board::MAC_ADDRESS, board::SEED),
+    );
 
-    use super::{Driver, Irqs, PACKETS, PTP_TIMESTAMPS, STACK_RESOURCES, board};
+    spawner.spawn(unwrap!(net_task(runner)));
+    spawner.spawn(unwrap!(ptp_task(ptp)));
+    loop {}
+}
 
-    #[shared]
-    struct Shared {}
+#[embassy_executor::task]
+async fn net_task(mut runner: embassy_net::Runner<'static, Driver>) -> ! {
+    runner.run().await
+}
 
-    #[local]
-    struct Local {
-        runner: embassy_net::Runner<'static, Driver>,
-        ptp: PtpRunner<'static, ETH>,
-    }
-
-    #[init(local = [
-        ptp_storage: PtpStorage = PtpStorage::new(),
-    ])]
-    fn init(c: init::Context) -> (Shared, Local) {
-        let p = embassy_stm32::init(board::stm32_config());
-
-        // Ethernet DMA buffers are placed in SRAM3 by this example linker
-        // script, so enable that RAM before initializing the packet queue.
-        pac::RCC.ahb2enr().modify(|w| w.set_sram3en(true));
-
-        // Keep hardware IRQs below the RTIC async software task priority. ETH
-        // wakes the network runner; TIM12 drives embassy-time deadlines.
-        Interrupt::ETH.set_priority(Priority::P6);
-        Interrupt::TIM8_BRK_TIM12.set_priority(Priority::P7);
-
-        #[cfg(feature = "stabilizer")]
-        {
-            use embassy_stm32::gpio::{Level, Output, Speed};
-            const SYSCLK_HZ: u32 = 400_000_000;
-
-            let mut phy_reset = Output::new(p.PE3, Level::Low, Speed::Low);
-            phy_reset.set_low();
-            cortex_m::asm::delay(SYSCLK_HZ / 4);
-            phy_reset.set_high();
-            cortex_m::asm::delay(SYSCLK_HZ / 4);
-            core::mem::forget(phy_reset);
-        }
-
-        let queue = unsafe {
-            let packets = core::ptr::addr_of_mut!(PACKETS);
-            PacketQueue::init_with_ptp(&mut *packets, &PTP_TIMESTAMPS);
-            (*packets).assume_init_mut()
-        };
-        let phy = GenericPhy::new(Sma::new(p.ETH_SMA, p.PA2, p.PC1), 0);
-        let mut driver = Ethernet::new_with_phy(
-            queue,
-            p.ETH,
-            Irqs,
-            p.PA1,
-            p.PA7,
-            p.PC4,
-            p.PC5,
-            p.PB12,
-            p.PG14,
-            p.PB11,
-            board::MAC_ADDRESS,
-            phy,
-        );
-        let ptp_clock = PtpClock::new(driver.start_ptp(PtpClockConfig::default()));
-        let (stack, runner) = embassy_net::new(
-            driver,
-            NetConfig::dhcpv4(Default::default()),
-            STACK_RESOURCES.init(StackResources::new()),
-            board::SEED,
-        );
-        let ptp = PtpRunner::new(
-            stack,
-            ptp_clock,
-            c.local.ptp_storage,
-            &PTP_TIMESTAMPS,
-            PtpConfig::new(board::MAC_ADDRESS, board::SEED),
-        );
-
-        network::spawn().unwrap();
-        ptp_task::spawn().unwrap();
-
-        (Shared {}, Local { runner, ptp })
-    }
-
-    #[task(priority = 1, local = [runner])]
-    async fn network(c: network::Context) -> ! {
-        c.local.runner.run().await
-    }
-
-    #[task(priority = 1, local = [ptp])]
-    async fn ptp_task(c: ptp_task::Context) -> ! {
-        c.local.ptp.run().await
-    }
+#[embassy_executor::task]
+async fn ptp_task(mut runner: PtpRunner<'static, ETH>) -> ! {
+    runner.run().await
 }

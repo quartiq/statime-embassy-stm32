@@ -19,8 +19,8 @@ example = [
 	"dep:cortex-m-rt",
 	"dep:defmt-rtt",
 	"dep:panic-probe",
-	"dep:rtic",
 	"dep:static_cell",
+	"dep:embassy-executor",
 	"embassy-net/dhcpv4",
 	"embassy-stm32/rt",
 	"embassy-stm32/stm32h743zi",
@@ -54,13 +54,14 @@ embassy-stm32 = { version = "0.6.0", default-features = false, features = [
 	"ptp",
 ] }
 embassy-time = { version = "0.5.1", default-features = false, features = ["defmt"] }
+embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "defmt"], optional = true }
 panic-probe = { version = "1.0.0", features = ["print-defmt"], optional = true }
-rtic = { version = "2.1", features = ["thumbv7-backend"], optional = true }
 static_cell = { version = "2.1.1", optional = true }
 
 [patch.crates-io]
 embassy-embedded-hal = { git = "https://github.com/embassy-rs/embassy.git", branch = "main" }
 embassy-futures = { git = "https://github.com/embassy-rs/embassy.git", branch = "main" }
+embassy-executor = { git = "https://github.com/embassy-rs/embassy.git", branch = "main" }
 embassy-hal-internal = { git = "https://github.com/embassy-rs/embassy.git", branch = "main" }
 embassy-net = { git = "https://github.com/embassy-rs/embassy.git", branch = "main" }
 embassy-net-driver = { git = "https://github.com/embassy-rs/embassy.git", branch = "main" }

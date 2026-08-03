@@ -377,7 +377,7 @@ async fn handle_actions(
             PortAction::SendGeneral { data, link_local } => {
                 let metadata = UdpMetadata {
                     endpoint: multicast_endpoint(GENERAL_PORT, link_local),
-                    meta: udp::PacketMeta::EMPTY,
+                    meta: udp::PacketMeta::default(),
                     local_address: None,
                 };
                 if let Err(error) = general_socket.send_to(data, metadata).await {
