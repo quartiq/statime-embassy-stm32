@@ -5,19 +5,17 @@ mod clock;
 mod log;
 mod storage;
 
-use core::{
-    future::poll_fn,
-    num::NonZero,
-    task::{Context, Poll},
-};
+use core::num::NonZero;
 
 use defmt::{info, warn};
-use embassy_futures::select::select3;
+use embassy_futures::select::{Either3, select3};
 use embassy_net::{
-    IpAddress, IpEndpoint, Ipv4Address, Stack, TryError, udp,
+    IpAddress, IpEndpoint, Ipv4Address, Stack, TryError,
+    driver::{Timestamp, TxTimestamp},
+    udp,
     udp::{UdpMetadata, UdpSocket},
 };
-use embassy_stm32::eth::{Instance, PtpTimestampStore as EthPtpTimestampStore};
+use embassy_stm32::eth::Instance;
 use embassy_time::{Duration as EmbassyDuration, Instant, with_deadline};
 use rand_core::SeedableRng;
 use rand_xorshift::XorShiftRng;
@@ -33,7 +31,7 @@ use statime::{
 };
 
 pub use clock::PtpClock;
-pub use embassy_stm32::eth::{PtpTimeProvider, PtpTimestamp};
+pub use embassy_stm32::eth::PtpTimeProvider;
 use log::{ServoLog, state_name};
 pub use storage::PtpStorage;
 
@@ -44,10 +42,6 @@ const LINK_LOCAL_MULTICAST: Ipv4Address = Ipv4Address::new(224, 0, 0, 107);
 const TX_TIMESTAMP_TIMEOUT: EmbassyDuration = EmbassyDuration::from_millis(100);
 const LOG_PERIOD: EmbassyDuration = EmbassyDuration::from_secs(10);
 const TX_PENDING: usize = 4;
-const TX_TIMESTAMPS: usize = 8;
-const RX_TIMESTAMPS: usize = 8;
-
-pub type PtpTimestampStore = EthPtpTimestampStore<TX_TIMESTAMPS, RX_TIMESTAMPS>;
 
 const MSG_DELAY_REQ: u8 = 0x1;
 const MSG_PDELAY_REQ: u8 = 0x2;
@@ -122,7 +116,6 @@ pub struct Runner<'a, T: Instance> {
     stack: Stack<'a>,
     clock: PtpClock<T>,
     storage: &'a mut PtpStorage,
-    timestamps: &'a PtpTimestampStore,
     config: Config,
 }
 
@@ -133,14 +126,12 @@ impl<'a, T: Instance> Runner<'a, T> {
         stack: Stack<'a>,
         clock: PtpClock<T>,
         storage: &'a mut PtpStorage,
-        timestamps: &'a PtpTimestampStore,
         config: Config,
     ) -> Self {
         Self {
             stack,
             clock,
             storage,
-            timestamps,
             config,
         }
     }
@@ -150,7 +141,6 @@ impl<'a, T: Instance> Runner<'a, T> {
         let stack = self.stack;
         let clock = &mut self.clock;
         let storage = &mut *self.storage;
-        let timestamps = self.timestamps;
         let config = self.config;
 
         info!("ptp: waiting for network configuration");
@@ -228,6 +218,7 @@ impl<'a, T: Instance> Runner<'a, T> {
         let mut pending_tx = PendingTxQueue::new(config.tx_timestamp_timeout);
         let mut bmca = deadline_from_now(instance.bmca_interval());
         let mut servo_log = ServoLog::new(config.log_period);
+        let mut tx_timestamp: Option<TxTimestamp> = None;
 
         handle_actions(
             actions,
@@ -268,9 +259,13 @@ impl<'a, T: Instance> Runner<'a, T> {
                 continue;
             }
 
-            let actions = if let Some((context, timestamp)) = pending_tx.poll_timestamp(timestamps)
-            {
-                port.handle_send_timestamp(context, time_from(timestamp))
+            let actions = if let Some(timestamp) = tx_timestamp.take() {
+                match pending_tx.take(timestamp.id) {
+                    Some(context) => {
+                        port.handle_send_timestamp(context, time_from(timestamp.timestamp))
+                    }
+                    None => PortActionIterator::empty(),
+                }
             } else if let Some(timer) = timers.take_due() {
                 match timer {
                     StatimeTimer::Announce => port.handle_announce_timer(&mut forwarded_tlvs),
@@ -283,7 +278,7 @@ impl<'a, T: Instance> Runner<'a, T> {
                 match event_socket.try_recv_from(&mut storage.packet) {
                     Ok((n, meta)) => {
                         let packet = &storage.packet[..n];
-                        if let Some(timestamp) = rx_event_timestamp(packet, meta.meta, timestamps) {
+                        if let Some(timestamp) = rx_event_timestamp(packet, meta.meta) {
                             port.handle_event_receive(packet, time_from(timestamp))
                         } else {
                             PortActionIterator::empty()
@@ -312,6 +307,7 @@ impl<'a, T: Instance> Runner<'a, T> {
                     }
                 }
             };
+            pending_tx.expire();
 
             handle_actions(
                 actions,
@@ -334,15 +330,18 @@ impl<'a, T: Instance> Runner<'a, T> {
             if let Some(timeout) = pending_tx.next_timeout_deadline() {
                 next = next.min(timeout);
             }
-            let _ = with_deadline(
+            if let Ok(Either3::First(timestamp)) = with_deadline(
                 next,
                 select3(
+                    stack.poll_tx_timestamps(),
                     event_socket.wait_recv_ready(),
                     general_socket.wait_recv_ready(),
-                    poll_fn(|cx| pending_tx.poll_timestamp_ready(timestamps, cx)),
                 ),
             )
-            .await;
+            .await
+            {
+                tx_timestamp = Some(timestamp);
+            }
         }
     }
 }
@@ -404,11 +403,7 @@ async fn handle_actions(
     }
 }
 
-fn rx_event_timestamp(
-    packet: &[u8],
-    meta: udp::PacketMeta,
-    timestamps: &PtpTimestampStore,
-) -> Option<PtpTimestamp> {
+fn rx_event_timestamp(packet: &[u8], meta: udp::PacketMeta) -> Option<Timestamp> {
     let message_type = ptp_message_type(packet)?;
     if matches!(
         message_type,
@@ -416,7 +411,7 @@ fn rx_event_timestamp(
     ) {
         return None;
     }
-    let timestamp = timestamps.rx_timestamp(meta);
+    let timestamp = meta.timestamp;
     if timestamp.is_none() {
         warn!(
             "ptp: missing rx timestamp packet_id={=u32} message_type={=u8}",
@@ -486,7 +481,7 @@ enum StatimeTimer {
 
 struct PendingTx {
     context: TimestampContext,
-    meta: udp::PacketMeta,
+    packet_id: u32,
     started: Instant,
 }
 
@@ -507,7 +502,7 @@ impl PendingTxQueue {
         if let Some(slot) = self.slots.iter_mut().find(|slot| slot.is_none()) {
             *slot = Some(PendingTx {
                 context,
-                meta,
+                packet_id: meta.id,
                 started: Instant::now(),
             });
         } else {
@@ -515,45 +510,30 @@ impl PendingTxQueue {
         }
     }
 
-    fn poll_timestamp(
-        &mut self,
-        timestamps: &PtpTimestampStore,
-    ) -> Option<(TimestampContext, PtpTimestamp)> {
+    fn take(&mut self, packet_id: u32) -> Option<TimestampContext> {
         for slot in self.slots.iter_mut() {
-            let Some(pending) = slot else {
-                continue;
-            };
-            if let Some(timestamp) = timestamps.tx_timestamp(pending.meta) {
-                let Some(pending) = slot.take() else {
-                    continue;
-                };
-                return Some((pending.context, timestamp));
-            }
-            if pending.started.elapsed() >= self.timeout {
-                warn!(
-                    "ptp: missing tx timestamp packet_id={=u32}",
-                    pending.meta.id
-                );
-                *slot = None;
+            if slot
+                .as_ref()
+                .is_some_and(|pending| pending.packet_id == packet_id)
+            {
+                return slot.take().map(|pending| pending.context);
             }
         }
         None
     }
 
-    fn poll_timestamp_ready(
-        &self,
-        timestamps: &PtpTimestampStore,
-        cx: &mut Context<'_>,
-    ) -> Poll<()> {
-        for slot in self.slots.iter() {
-            let Some(pending) = slot else {
-                continue;
-            };
-            if timestamps.poll_tx_timestamp(pending.meta, cx).is_ready() {
-                return Poll::Ready(());
+    fn expire(&mut self) {
+        for slot in self.slots.iter_mut() {
+            if let Some(pending) = slot
+                && pending.started.elapsed() >= self.timeout
+            {
+                warn!(
+                    "ptp: missing tx timestamp packet_id={=u32}",
+                    pending.packet_id
+                );
+                *slot = None;
             }
         }
-        Poll::Pending
     }
 
     fn next_timeout_deadline(&self) -> Option<Instant> {
@@ -579,6 +559,7 @@ impl PacketIdGenerator {
         self.0 = self.0.checked_add(1).unwrap_or(NonZero::<u32>::MIN);
         let mut meta = udp::PacketMeta::default();
         meta.id = id.get();
+        meta.request_timestamp = true;
         meta
     }
 }
@@ -588,8 +569,8 @@ fn clock_identity_from_mac(mac: [u8; 6]) -> ClockIdentity {
     ClockIdentity([mac[0], mac[1], mac[2], 0xff, 0xfe, mac[3], mac[4], mac[5]])
 }
 
-fn time_from(timestamp: PtpTimestamp) -> Time {
-    Time::from_nanos(timestamp.seconds as u64 * 1_000_000_000 + timestamp.nanos as u64)
+fn time_from(timestamp: Timestamp) -> Time {
+    Time::from_nanos(timestamp.seconds as u64 * 1_000_000_000 + timestamp.nanos() as u64)
 }
 
 fn multicast_endpoint(port: u16, link_local: bool) -> IpEndpoint {

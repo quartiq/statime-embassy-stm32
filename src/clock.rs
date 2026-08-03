@@ -38,7 +38,7 @@ impl<T: Instance> StatimeClock for &mut PtpClock<T> {
 
     fn now(&self) -> Time {
         let timestamp = self.inner.now();
-        Time::from_nanos(timestamp.seconds as u64 * 1_000_000_000 + timestamp.nanos as u64)
+        Time::from_nanos(timestamp.seconds as u64 * 1_000_000_000 + timestamp.nanos() as u64)
     }
 
     fn step_clock(&mut self, offset: Duration) -> Result<Time, Self::Error> {

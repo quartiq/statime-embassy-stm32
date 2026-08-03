@@ -46,6 +46,7 @@ embassy-net = { version = "0.9.1", default-features = false, features = [
 	"medium-ethernet",
 	"multicast",
 	"packetmeta-id",
+	"packetmeta-timestamp",
 	"proto-ipv4",
 	"udp",
 ] }

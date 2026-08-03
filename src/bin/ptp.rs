@@ -16,7 +16,6 @@ use embassy_stm32::{
     pac::{self, Interrupt},
 };
 use static_cell::StaticCell;
-use statime_embassy_stm32::PtpTimestampStore;
 use statime_embassy_stm32::{Config as PtpConfig, PtpClock, PtpStorage, Runner as PtpRunner};
 
 use {defmt_rtt as _, panic_probe as _};
@@ -41,7 +40,6 @@ bind_interrupts!(struct Irqs {
 #[unsafe(link_section = ".sram3.eth")]
 static mut PACKETS: MaybeUninit<PacketQueue<ETH_TX_PACKETS, ETH_RX_PACKETS>> =
     MaybeUninit::uninit();
-static PTP_TIMESTAMPS: PtpTimestampStore = PtpTimestampStore::new();
 static PTP_STORAGE: StaticCell<PtpStorage> = StaticCell::new();
 static STACK_RESOURCES: StaticCell<StackResources<STACK_SOCKETS>> = StaticCell::new();
 
@@ -115,7 +113,7 @@ async fn main(spawner: Spawner) -> ! {
 
     let queue = unsafe {
         let packets = core::ptr::addr_of_mut!(PACKETS);
-        PacketQueue::init_with_ptp(&mut *packets, &PTP_TIMESTAMPS);
+        PacketQueue::init(&mut *packets);
         (*packets).assume_init_mut()
     };
     let phy = GenericPhy::new(Sma::new(p.ETH_SMA, p.PA2, p.PC1), 0);
@@ -144,13 +142,12 @@ async fn main(spawner: Spawner) -> ! {
         stack,
         ptp_clock,
         PTP_STORAGE.init(PtpStorage::new()),
-        &PTP_TIMESTAMPS,
         PtpConfig::new(board::MAC_ADDRESS, board::SEED),
     );
 
     spawner.spawn(unwrap!(net_task(runner)));
     spawner.spawn(unwrap!(ptp_task(ptp)));
-    loop {}
+    match core::future::pending::<core::convert::Infallible>().await {}
 }
 
 #[embassy_executor::task]
