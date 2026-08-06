@@ -16,7 +16,7 @@ use embassy_stm32::{
     pac::{self, Interrupt},
 };
 use static_cell::StaticCell;
-use statime_embassy_stm32::{Config as PtpConfig, PtpClock, PtpStorage, Runner as PtpRunner};
+use statime_embassy_net::{Config as PtpConfig, PtpStorage, Runner as PtpRunner, stm32::PtpClock};
 
 use {defmt_rtt as _, panic_probe as _};
 
@@ -93,8 +93,7 @@ async fn main(spawner: Spawner) -> ! {
     // script, so enable that RAM before initializing the packet queue.
     pac::RCC.ahb2enr().modify(|w| w.set_sram3en(true));
 
-    // Keep hardware IRQs below the RTIC async software task priority. ETH
-    // wakes the network runner; TIM12 drives embassy-time deadlines.
+    // ETH wakes the network runner; TIM12 drives embassy-time deadlines.
     Interrupt::ETH.set_priority(Priority::P6);
     Interrupt::TIM8_BRK_TIM12.set_priority(Priority::P7);
 
@@ -156,6 +155,6 @@ async fn net_task(mut runner: embassy_net::Runner<'static, Driver>) -> ! {
 }
 
 #[embassy_executor::task]
-async fn ptp_task(mut runner: PtpRunner<'static, ETH>) -> ! {
+async fn ptp_task(runner: PtpRunner<'static, PtpClock<ETH>>) -> ! {
     runner.run().await
 }

@@ -2,13 +2,50 @@
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
 
-mod clock;
+#[cfg(feature = "defmt")]
+macro_rules! debug {
+    ($($token:tt)*) => { defmt::debug!($($token)*) };
+}
+#[cfg(not(feature = "defmt"))]
+macro_rules! debug {
+    ($format:literal $(, $argument:expr)* $(,)?) => {{
+        if false {
+            $(let _ = &$argument;)*
+        }
+    }};
+}
+#[cfg(feature = "defmt")]
+macro_rules! info {
+    ($($token:tt)*) => { defmt::info!($($token)*) };
+}
+#[cfg(not(feature = "defmt"))]
+macro_rules! info {
+    ($format:literal $(, $argument:expr)* $(,)?) => {{
+        if false {
+            $(let _ = &$argument;)*
+        }
+    }};
+}
+#[cfg(feature = "defmt")]
+macro_rules! warn {
+    ($($token:tt)*) => { defmt::warn!($($token)*) };
+}
+#[cfg(not(feature = "defmt"))]
+macro_rules! warn {
+    ($format:literal $(, $argument:expr)* $(,)?) => {{
+        if false {
+            $(let _ = &$argument;)*
+        }
+    }};
+}
+
 mod log;
+#[cfg(feature = "stm32")]
+/// STM32 Ethernet PTP clock integration.
+pub mod stm32;
 mod storage;
 
 use core::num::NonZero;
-
-use defmt::{info, warn};
 use embassy_futures::select::{Either3, select3};
 use embassy_net::{
     IpAddress, IpEndpoint, Ipv4Address, Stack, TryError,
@@ -16,12 +53,11 @@ use embassy_net::{
     udp,
     udp::{UdpMetadata, UdpSocket},
 };
-use embassy_stm32::eth::Instance;
 use embassy_time::{Duration as EmbassyDuration, Instant, with_deadline};
 use rand_core::SeedableRng;
 use rand_xorshift::XorShiftRng;
 use statime::{
-    PtpInstance,
+    Clock, PtpInstance,
     config::{
         AcceptAnyMaster, ClockIdentity, DelayMechanism, InstanceConfig, PortConfig,
         PtpMinorVersion, TimePropertiesDS, TimeSource,
@@ -31,8 +67,6 @@ use statime::{
     time::{Duration, Interval, Time},
 };
 
-pub use clock::PtpClock;
-pub use embassy_stm32::eth::PtpTimeProvider;
 use log::{ServoLog, state_name};
 pub use storage::PtpStorage;
 
@@ -43,10 +77,6 @@ const LINK_LOCAL_MULTICAST: Ipv4Address = Ipv4Address::new(224, 0, 0, 107);
 const TX_TIMESTAMP_TIMEOUT: EmbassyDuration = EmbassyDuration::from_millis(100);
 const LOG_PERIOD: EmbassyDuration = EmbassyDuration::from_secs(10);
 const TX_PENDING: usize = 4;
-
-const MSG_DELAY_REQ: u8 = 0x1;
-const MSG_PDELAY_REQ: u8 = 0x2;
-const MSG_PDELAY_RESP: u8 = 0x3;
 
 /// Configuration for one PTP ordinary-clock runner.
 #[non_exhaustive]
@@ -119,22 +149,20 @@ impl Config {
 /// Construct one runner per Ethernet port and call [`run`](Self::run) from a
 /// background task. Dropping the future is not a supported recovery path; this
 /// is intended to run for the lifetime of the network stack.
-pub struct Runner<'a, T: Instance> {
+///
+/// The clock must control the same hardware time domain used for packet
+/// timestamps by the underlying network driver.
+pub struct Runner<'a, C> {
     stack: Stack<'a>,
-    clock: PtpClock<T>,
+    clock: C,
     storage: &'a mut PtpStorage,
     config: Config,
 }
 
-impl<'a, T: Instance> Runner<'a, T> {
+impl<'a, C: Clock> Runner<'a, C> {
     /// Bind the PTP service to an Embassy network stack, PTP clock, socket
-    /// storage, timestamp store, and protocol configuration.
-    pub fn new(
-        stack: Stack<'a>,
-        clock: PtpClock<T>,
-        storage: &'a mut PtpStorage,
-        config: Config,
-    ) -> Self {
+    /// storage, and protocol configuration.
+    pub fn new(stack: Stack<'a>, clock: C, storage: &'a mut PtpStorage, config: Config) -> Self {
         Self {
             stack,
             clock,
@@ -144,10 +172,10 @@ impl<'a, T: Instance> Runner<'a, T> {
     }
 
     /// Run the PTP service forever.
-    pub async fn run(&mut self) -> ! {
+    pub async fn run(self) -> ! {
         let stack = self.stack;
-        let clock = &mut self.clock;
-        let storage = &mut *self.storage;
+        let clock = self.clock;
+        let storage = self.storage;
         let config = self.config;
 
         info!("ptp: waiting for network configuration");
@@ -412,12 +440,6 @@ async fn handle_actions(
 
 fn rx_event_timestamp(packet: &[u8], meta: udp::PacketMeta) -> Option<Timestamp> {
     let message_type = ptp_message_type(packet)?;
-    if matches!(
-        message_type,
-        MSG_DELAY_REQ | MSG_PDELAY_REQ | MSG_PDELAY_RESP
-    ) {
-        return None;
-    }
     let timestamp = meta.timestamp;
     if timestamp.is_none() {
         warn!(
@@ -577,7 +599,9 @@ fn clock_identity_from_mac(mac: [u8; 6]) -> ClockIdentity {
 }
 
 fn time_from(timestamp: Timestamp) -> Time {
-    Time::from_nanos(timestamp.seconds as u64 * 1_000_000_000 + timestamp.nanos() as u64)
+    let nanos =
+        u64::from(timestamp.seconds) * 1_000_000_000 + u64::from(timestamp.quarter_nanos >> 2);
+    Time::from_nanos_subnanos(nanos, (timestamp.quarter_nanos & 3) << 30)
 }
 
 fn multicast_endpoint(port: u16, link_local: bool) -> IpEndpoint {
@@ -592,4 +616,33 @@ fn multicast_endpoint(port: u16, link_local: bool) -> IpEndpoint {
 fn deadline_from_now(duration: core::time::Duration) -> Instant {
     let nanos = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
     Instant::now() + EmbassyDuration::from_nanos(nanos)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preserves_quarter_nanoseconds() {
+        for (quarter_nanos, subnanos) in [(40, 0), (41, 1 << 30), (42, 1 << 31), (43, 3 << 30)] {
+            assert_eq!(
+                time_from(Timestamp {
+                    seconds: 2,
+                    quarter_nanos,
+                }),
+                Time::from_nanos_subnanos(2_000_000_010, subnanos),
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_timestamped_delay_requests() {
+        let mut packet = [0; 34];
+        packet[0] = 1;
+        let timestamp = Timestamp::from_seconds_and_nanos(2, 10);
+        let mut meta = udp::PacketMeta::default();
+        meta.timestamp = Some(timestamp);
+
+        assert_eq!(rx_event_timestamp(&packet, meta), Some(timestamp));
+    }
 }

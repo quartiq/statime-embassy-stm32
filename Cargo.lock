@@ -1037,7 +1037,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "statime-embassy-stm32"
+name = "statime-embassy-net"
 version = "0.1.0"
 dependencies = [
  "cortex-m",

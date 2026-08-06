@@ -1,12 +1,15 @@
 use core::convert::Infallible;
 
-use defmt::{debug, info};
-use embassy_stm32::eth::{Instance, PtpClock as EthPtpClock, PtpTimeProvider};
+use embassy_stm32::eth::{Instance, PtpClock as EthPtpClock};
 use statime::{
     Clock as StatimeClock,
     config::TimePropertiesDS,
     time::{Duration, Time},
 };
+
+use crate::time_from;
+
+pub use embassy_stm32::eth::PtpTimeProvider;
 
 #[derive(Debug)]
 /// Statime clock backed by the STM32 Ethernet MAC PTP clock.
@@ -36,12 +39,11 @@ impl<T: Instance> PtpClock<T> {
     }
 }
 
-impl<T: Instance> StatimeClock for &mut PtpClock<T> {
+impl<T: Instance> StatimeClock for PtpClock<T> {
     type Error = Infallible;
 
     fn now(&self) -> Time {
-        let timestamp = self.inner.now();
-        Time::from_nanos(timestamp.seconds as u64 * 1_000_000_000 + timestamp.nanos() as u64)
+        time_from(self.inner.now())
     }
 
     fn step_clock(&mut self, offset: Duration) -> Result<Time, Self::Error> {
