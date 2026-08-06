@@ -153,6 +153,6 @@ async fn net_task(mut runner: embassy_net::Runner<'static, Driver>) -> ! {
 }
 
 #[embassy_executor::task]
-async fn ptp_task(runner: PtpRunner<'static, PtpClock<ETH>>) -> ! {
+async fn ptp_task(mut runner: PtpRunner<'static, PtpClock<ETH>>) -> ! {
     runner.run().await
 }

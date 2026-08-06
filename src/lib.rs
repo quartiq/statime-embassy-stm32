@@ -27,6 +27,7 @@ use statime::{
         PtpMinorVersion, TimePropertiesDS, TimeSource,
     },
     filters::{KalmanConfiguration, KalmanFilter},
+    observability::port::PortState,
     port::{NoForwardedTLVs, PortAction, PortActionIterator, TimestampContext},
     time::{Duration, Interval, Time},
 };
@@ -41,6 +42,9 @@ const LINK_LOCAL_MULTICAST: Ipv4Address = Ipv4Address::new(224, 0, 0, 107);
 const TX_TIMESTAMP_TIMEOUT: EmbassyDuration = EmbassyDuration::from_millis(100);
 const LOG_PERIOD: EmbassyDuration = EmbassyDuration::from_secs(10);
 const TX_PENDING: usize = 4;
+const MSG_DELAY_REQ: u8 = 0x1;
+const MSG_PDELAY_REQ: u8 = 0x2;
+const MSG_PDELAY_RESP: u8 = 0x3;
 
 /// Configuration for one PTP ordinary-clock runner.
 #[non_exhaustive]
@@ -123,6 +127,28 @@ pub struct Runner<'a, C> {
     config: Config,
 }
 
+struct ClockRef<'a, C>(&'a mut C);
+
+impl<C: Clock> Clock for ClockRef<'_, C> {
+    type Error = C::Error;
+
+    fn now(&self) -> Time {
+        self.0.now()
+    }
+
+    fn step_clock(&mut self, offset: Duration) -> Result<Time, Self::Error> {
+        self.0.step_clock(offset)
+    }
+
+    fn set_frequency(&mut self, ppm: f64) -> Result<Time, Self::Error> {
+        self.0.set_frequency(ppm)
+    }
+
+    fn set_properties(&mut self, time_properties_ds: &TimePropertiesDS) -> Result<(), Self::Error> {
+        self.0.set_properties(time_properties_ds)
+    }
+}
+
 impl<'a, C: Clock> Runner<'a, C> {
     /// Bind the PTP service to an Embassy network stack, PTP clock, socket
     /// storage, and protocol configuration.
@@ -136,10 +162,10 @@ impl<'a, C: Clock> Runner<'a, C> {
     }
 
     /// Run the PTP service forever.
-    pub async fn run(self) -> ! {
+    pub async fn run(&mut self) -> ! {
         let stack = self.stack;
-        let clock = self.clock;
-        let storage = self.storage;
+        let clock = ClockRef(&mut self.clock);
+        let storage = &mut *self.storage;
         let config = self.config;
 
         info!("ptp: waiting for network configuration");
@@ -254,7 +280,8 @@ impl<'a, C: Clock> Runner<'a, C> {
                     StatimeTimer::FilterUpdate => port.handle_filter_update_timer(),
                 }
             } else {
-                match io.receive(&mut storage.packet) {
+                let receive_delay_requests = port.port_ds().port_state == PortState::Master;
+                match io.receive(&mut storage.packet, receive_delay_requests) {
                     Incoming::Event(packet, timestamp) => {
                         port.handle_event_receive(packet, time_from(timestamp))
                     }
@@ -349,13 +376,14 @@ impl<'a> PortIo<'a> {
         }
     }
 
-    fn receive<'b>(&self, packet: &'b mut [u8]) -> Incoming<'b> {
+    fn receive<'b>(&self, packet: &'b mut [u8], receive_delay_requests: bool) -> Incoming<'b> {
         match self.event.try_recv_from(packet) {
             Ok((n, meta)) => {
                 let packet = &packet[..n];
-                return rx_event_timestamp(packet, meta.meta).map_or(Incoming::None, |timestamp| {
-                    Incoming::Event(packet, timestamp)
-                });
+                return rx_event_timestamp(packet, meta.meta, receive_delay_requests)
+                    .map_or(Incoming::None, |timestamp| {
+                        Incoming::Event(packet, timestamp)
+                    });
             }
             Err(TryError::Other(udp::RecvError::Truncated)) => {
                 warn!("ptp: truncated event packet");
@@ -409,8 +437,17 @@ enum Incoming<'a> {
     None,
 }
 
-fn rx_event_timestamp(packet: &[u8], meta: udp::PacketMeta) -> Option<Timestamp> {
+fn rx_event_timestamp(
+    packet: &[u8],
+    meta: udp::PacketMeta,
+    receive_delay_requests: bool,
+) -> Option<Timestamp> {
     let message_type = ptp_message_type(packet)?;
+    if matches!(message_type, MSG_PDELAY_REQ | MSG_PDELAY_RESP)
+        || message_type == MSG_DELAY_REQ && !receive_delay_requests
+    {
+        return None;
+    }
     let timestamp = meta.timestamp;
     if timestamp.is_none() {
         warn!(
@@ -592,14 +629,29 @@ mod tests {
     }
 
     #[test]
-    fn accepts_timestamped_delay_requests() {
+    fn accepts_delay_requests_only_for_a_master() {
         init_logging();
         let mut packet = [0; 34];
-        packet[0] = 1;
+        packet[0] = MSG_DELAY_REQ;
         let timestamp = Timestamp::from_seconds_and_nanos(2, 10);
         let mut meta = udp::PacketMeta::default();
         meta.timestamp = Some(timestamp);
 
-        assert_eq!(rx_event_timestamp(&packet, meta), Some(timestamp));
+        assert_eq!(rx_event_timestamp(&packet, meta, false), None);
+        assert_eq!(rx_event_timestamp(&packet, meta, true), Some(timestamp));
+    }
+
+    #[test]
+    fn ignores_peer_delay_messages() {
+        init_logging();
+        let timestamp = Timestamp::from_seconds_and_nanos(2, 10);
+        let mut meta = udp::PacketMeta::default();
+        meta.timestamp = Some(timestamp);
+
+        for message_type in [MSG_PDELAY_REQ, MSG_PDELAY_RESP] {
+            let mut packet = [0; 34];
+            packet[0] = message_type;
+            assert_eq!(rx_event_timestamp(&packet, meta, true), None);
+        }
     }
 }
