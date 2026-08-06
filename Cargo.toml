@@ -15,10 +15,8 @@ required-features = ["example"]
 default = []
 stabilizer = ["example"]
 stm32 = ["dep:embassy-stm32"]
-defmt = ["dep:defmt", "embassy-net/defmt", "embassy-time/defmt", "embassy-stm32?/defmt"]
 example = [
 	"stm32",
-	"defmt",
 	"dep:cortex-m",
 	"dep:cortex-m-rt",
 	"dep:defmt-rtt",
@@ -42,10 +40,11 @@ cortex-m = { version = "0.7.7", features = [
 	"critical-section-single-core",
 ], optional = true }
 cortex-m-rt = { version = "0.7", features = ["device"], optional = true }
-defmt = { version = "1.0.1", optional = true }
+defmt = "1.0.1"
 defmt-rtt = { version = "1.1.0", optional = true }
 embassy-futures = { version = "0.1.2", default-features = false }
 embassy-net = { version = "0.9.1", default-features = false, features = [
+	"defmt",
 	"medium-ethernet",
 	"multicast",
 	"packetmeta-id",
@@ -53,11 +52,17 @@ embassy-net = { version = "0.9.1", default-features = false, features = [
 	"proto-ipv4",
 	"udp",
 ] }
-embassy-stm32 = { version = "0.6.0", default-features = false, optional = true, features = ["ptp"] }
-embassy-time = { version = "0.5.1", default-features = false }
+embassy-stm32 = { version = "0.6.0", default-features = false, optional = true, features = [
+	"defmt",
+	"ptp",
+] }
+embassy-time = { version = "0.5.1", default-features = false, features = ["defmt"] }
 embassy-executor = { version = "0.10.0", features = ["platform-cortex-m", "executor-thread", "defmt"], optional = true }
 panic-probe = { version = "1.0.0", features = ["print-defmt"], optional = true }
 static_cell = { version = "2.1.1", optional = true }
+
+[dev-dependencies]
+defmt2log = "0.2.1"
 
 [patch.crates-io]
 embassy-embedded-hal = { git = "https://github.com/embassy-rs/embassy.git", branch = "main" }

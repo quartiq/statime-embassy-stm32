@@ -14,7 +14,6 @@ The network driver must provide packet timestamps through `embassy-net` packet
 metadata and asynchronous transmit timestamp polling. The optional `stm32`
 feature provides a clock adapter for the Embassy STM32 Ethernet PTP clock.
 Applications using it must select their concrete `embassy-stm32` chip feature.
-Enable the `defmt` feature for embedded logging.
 
 The runner is currently a single-port UDP/IPv4 ordinary clock using E2E delay
 measurement. It is slave-only by default.

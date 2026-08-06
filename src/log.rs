@@ -1,3 +1,4 @@
+use defmt::debug;
 use embassy_time::{Duration, Instant};
 use statime::{filters::FilterEstimate, observability::port::PortState};
 

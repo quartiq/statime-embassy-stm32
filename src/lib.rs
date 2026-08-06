@@ -1,43 +1,6 @@
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 #![doc = include_str!("../README.md")]
 #![warn(missing_docs)]
-
-#[cfg(feature = "defmt")]
-macro_rules! debug {
-    ($($token:tt)*) => { defmt::debug!($($token)*) };
-}
-#[cfg(not(feature = "defmt"))]
-macro_rules! debug {
-    ($format:literal $(, $argument:expr)* $(,)?) => {{
-        if false {
-            $(let _ = &$argument;)*
-        }
-    }};
-}
-#[cfg(feature = "defmt")]
-macro_rules! info {
-    ($($token:tt)*) => { defmt::info!($($token)*) };
-}
-#[cfg(not(feature = "defmt"))]
-macro_rules! info {
-    ($format:literal $(, $argument:expr)* $(,)?) => {{
-        if false {
-            $(let _ = &$argument;)*
-        }
-    }};
-}
-#[cfg(feature = "defmt")]
-macro_rules! warn {
-    ($($token:tt)*) => { defmt::warn!($($token)*) };
-}
-#[cfg(not(feature = "defmt"))]
-macro_rules! warn {
-    ($format:literal $(, $argument:expr)* $(,)?) => {{
-        if false {
-            $(let _ = &$argument;)*
-        }
-    }};
-}
 
 mod log;
 #[cfg(feature = "stm32")]
@@ -46,6 +9,7 @@ pub mod stm32;
 mod storage;
 
 use core::num::NonZero;
+use defmt::{info, warn};
 use embassy_futures::select::{Either3, select3};
 use embassy_net::{
     IpAddress, IpEndpoint, Ipv4Address, Stack, TryError,
@@ -622,8 +586,14 @@ fn deadline_from_now(duration: core::time::Duration) -> Instant {
 mod tests {
     use super::*;
 
+    fn init_logging() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(defmt2log::init_from_current_exe);
+    }
+
     #[test]
     fn preserves_quarter_nanoseconds() {
+        init_logging();
         for (quarter_nanos, subnanos) in [(40, 0), (41, 1 << 30), (42, 1 << 31), (43, 3 << 30)] {
             assert_eq!(
                 time_from(Timestamp {
@@ -637,6 +607,7 @@ mod tests {
 
     #[test]
     fn accepts_timestamped_delay_requests() {
+        init_logging();
         let mut packet = [0; 34];
         packet[0] = 1;
         let timestamp = Timestamp::from_seconds_and_nanos(2, 10);

@@ -1,5 +1,6 @@
 use core::convert::Infallible;
 
+use defmt::{debug, info};
 use embassy_stm32::eth::{Instance, PtpClock as EthPtpClock};
 use statime::{
     Clock as StatimeClock,
