@@ -1,19 +1,23 @@
 use embassy_net::udp::PacketMetadata;
 
-pub const PACKET_BYTES: usize = 256;
-pub const EVENT_RX_PACKETS: usize = 4;
-pub const EVENT_TX_PACKETS: usize = 2;
-pub const GENERAL_RX_PACKETS: usize = 4;
-pub const GENERAL_TX_PACKETS: usize = 1;
-pub const EVENT_RX_BYTES: usize = PACKET_BYTES * EVENT_RX_PACKETS;
-pub const EVENT_TX_BYTES: usize = PACKET_BYTES * EVENT_TX_PACKETS;
-pub const GENERAL_RX_BYTES: usize = PACKET_BYTES * GENERAL_RX_PACKETS;
-pub const GENERAL_TX_BYTES: usize = PACKET_BYTES * GENERAL_TX_PACKETS;
+const PACKET_BYTES: usize = 256;
+const EVENT_RX_PACKETS: usize = 4;
+const EVENT_TX_PACKETS: usize = 2;
+const GENERAL_RX_PACKETS: usize = 4;
+const GENERAL_TX_PACKETS: usize = 1;
 
-type EventStorage =
-    SocketStorage<EVENT_RX_PACKETS, EVENT_TX_PACKETS, EVENT_RX_BYTES, EVENT_TX_BYTES>;
-type GeneralStorage =
-    SocketStorage<GENERAL_RX_PACKETS, GENERAL_TX_PACKETS, GENERAL_RX_BYTES, GENERAL_TX_BYTES>;
+type EventStorage = SocketStorage<
+    EVENT_RX_PACKETS,
+    EVENT_TX_PACKETS,
+    { PACKET_BYTES * EVENT_RX_PACKETS },
+    { PACKET_BYTES * EVENT_TX_PACKETS },
+>;
+type GeneralStorage = SocketStorage<
+    GENERAL_RX_PACKETS,
+    GENERAL_TX_PACKETS,
+    { PACKET_BYTES * GENERAL_RX_PACKETS },
+    { PACKET_BYTES * GENERAL_TX_PACKETS },
+>;
 
 /// Static packet and socket storage for one [`crate::Runner`].
 pub struct PtpStorage {

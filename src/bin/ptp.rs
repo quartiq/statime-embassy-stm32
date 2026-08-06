@@ -9,11 +9,9 @@ use embassy_net::{Config as NetConfig, StackResources};
 use embassy_stm32::{
     bind_interrupts,
     eth::{Ethernet, GenericPhy, InterruptHandler, PacketQueue, PtpClockConfig, Sma},
-    peripherals::{ETH, ETH_SMA},
-};
-use embassy_stm32::{
     interrupt::{InterruptExt as _, Priority},
     pac::{self, Interrupt},
+    peripherals::{ETH, ETH_SMA},
 };
 use static_cell::StaticCell;
 use statime_embassy_net::{Config as PtpConfig, PtpStorage, Runner as PtpRunner, stm32::PtpClock};

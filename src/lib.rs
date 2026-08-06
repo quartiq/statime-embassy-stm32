@@ -157,22 +157,21 @@ impl<'a, C: Clock> Runner<'a, C> {
             }
         }
 
-        let mut event_socket = UdpSocket::new(
+        let event_socket = UdpSocket::new(
             stack,
             &mut storage.event.rx_meta,
             &mut storage.event.rx_buffer,
             &mut storage.event.tx_meta,
             &mut storage.event.tx_buffer,
         );
-        let mut general_socket = UdpSocket::new(
+        let general_socket = UdpSocket::new(
             stack,
             &mut storage.general.rx_meta,
             &mut storage.general.rx_buffer,
             &mut storage.general.tx_meta,
             &mut storage.general.tx_buffer,
         );
-        event_socket.bind(EVENT_PORT).unwrap();
-        general_socket.bind(GENERAL_PORT).unwrap();
+        let mut io = PortIo::new(event_socket, general_socket, config.tx_timestamp_timeout);
 
         let clock_identity = clock_identity_from_mac(config.mac_address);
         info!(
@@ -211,23 +210,12 @@ impl<'a, C: Clock> Runner<'a, C> {
         );
         let (mut port, actions) = port.end_bmca();
 
-        let mut timers = Timers::default();
         let mut forwarded_tlvs = NoForwardedTLVs;
-        let mut packet_id = PacketIdGenerator::new();
-        let mut pending_tx = PendingTxQueue::new(config.tx_timestamp_timeout);
         let mut bmca = deadline_from_now(instance.bmca_interval());
         let mut servo_log = ServoLog::new(config.log_period);
         let mut tx_timestamp: Option<TxTimestamp> = None;
 
-        handle_actions(
-            actions,
-            &event_socket,
-            &general_socket,
-            &mut timers,
-            &mut packet_id,
-            &mut pending_tx,
-        )
-        .await;
+        io.handle(actions).await;
         info!("ptp: task started");
 
         loop {
@@ -246,26 +234,18 @@ impl<'a, C: Clock> Runner<'a, C> {
                         state_name(new_state)
                     );
                 }
-                handle_actions(
-                    actions,
-                    &event_socket,
-                    &general_socket,
-                    &mut timers,
-                    &mut packet_id,
-                    &mut pending_tx,
-                )
-                .await;
+                io.handle(actions).await;
                 continue;
             }
 
             let actions = if let Some(timestamp) = tx_timestamp.take() {
-                match pending_tx.take(timestamp.id) {
+                match io.pending_tx.take(timestamp.id) {
                     Some(context) => {
                         port.handle_send_timestamp(context, time_from(timestamp.timestamp))
                     }
                     None => PortActionIterator::empty(),
                 }
-            } else if let Some(timer) = timers.take_due() {
+            } else if let Some(timer) = io.timers.take_due() {
                 match timer {
                     StatimeTimer::Announce => port.handle_announce_timer(&mut forwarded_tlvs),
                     StatimeTimer::Sync => port.handle_sync_timer(),
@@ -274,132 +254,159 @@ impl<'a, C: Clock> Runner<'a, C> {
                     StatimeTimer::FilterUpdate => port.handle_filter_update_timer(),
                 }
             } else {
-                match event_socket.try_recv_from(&mut storage.packet) {
-                    Ok((n, meta)) => {
-                        let packet = &storage.packet[..n];
-                        if let Some(timestamp) = rx_event_timestamp(packet, meta.meta) {
-                            port.handle_event_receive(packet, time_from(timestamp))
-                        } else {
-                            PortActionIterator::empty()
-                        }
+                match io.receive(&mut storage.packet) {
+                    Incoming::Event(packet, timestamp) => {
+                        port.handle_event_receive(packet, time_from(timestamp))
                     }
-                    Err(TryError::Other(udp::RecvError::Truncated)) => {
-                        warn!("ptp: truncated event packet");
-                        PortActionIterator::empty()
-                    }
-                    Err(TryError::WouldBlock) => {
-                        match general_socket.try_recv_from(&mut storage.packet) {
-                            Ok((n, _meta)) => {
-                                let packet = &storage.packet[..n];
-                                if ptp_message_type(packet).is_some() {
-                                    port.handle_general_receive(packet)
-                                } else {
-                                    PortActionIterator::empty()
-                                }
-                            }
-                            Err(TryError::Other(udp::RecvError::Truncated)) => {
-                                warn!("ptp: truncated general packet");
-                                PortActionIterator::empty()
-                            }
-                            Err(TryError::WouldBlock) => PortActionIterator::empty(),
-                        }
-                    }
+                    Incoming::General(packet) => port.handle_general_receive(packet),
+                    Incoming::None => PortActionIterator::empty(),
                 }
             };
-            pending_tx.expire();
+            io.pending_tx.expire();
 
-            handle_actions(
-                actions,
-                &event_socket,
-                &general_socket,
-                &mut timers,
-                &mut packet_id,
-                &mut pending_tx,
-            )
-            .await;
+            io.handle(actions).await;
 
             servo_log.log_if_due(
                 port.port_ds().port_state,
                 port.port_current_ds_contribution(),
             );
-            let mut next = bmca.min(servo_log.next_deadline());
-            if let Some(timer) = timers.next_deadline() {
-                next = next.min(timer);
-            }
-            if let Some(timeout) = pending_tx.next_timeout_deadline() {
-                next = next.min(timeout);
-            }
-            if let Ok(Either3::First(timestamp)) = with_deadline(
-                next,
-                select3(
-                    stack.poll_tx_timestamps(),
-                    event_socket.wait_recv_ready(),
-                    general_socket.wait_recv_ready(),
-                ),
-            )
-            .await
-            {
-                tx_timestamp = Some(timestamp);
-            }
+            let next = io.next_deadline(bmca.min(servo_log.next_deadline()));
+            tx_timestamp = io.wait(stack, next).await;
         }
     }
 }
 
-async fn handle_actions(
-    actions: PortActionIterator<'_>,
-    event_socket: &UdpSocket<'_>,
-    general_socket: &UdpSocket<'_>,
-    timers: &mut Timers,
-    packet_id: &mut PacketIdGenerator,
-    pending_tx: &mut PendingTxQueue,
-) {
-    for action in actions {
-        match action {
-            PortAction::SendEvent {
-                context,
-                data,
-                link_local,
-            } => {
-                let metadata = UdpMetadata {
-                    endpoint: multicast_endpoint(EVENT_PORT, link_local),
-                    meta: packet_id.next(),
-                    local_address: None,
-                };
-                match event_socket.send_to(data, metadata).await {
-                    Ok(()) => pending_tx.push(context, metadata.meta),
-                    Err(error) => {
-                        warn!("ptp: event send failed: {}", &error)
-                    }
-                }
-            }
-            PortAction::SendGeneral { data, link_local } => {
-                let metadata = UdpMetadata {
-                    endpoint: multicast_endpoint(GENERAL_PORT, link_local),
-                    meta: udp::PacketMeta::default(),
-                    local_address: None,
-                };
-                if let Err(error) = general_socket.send_to(data, metadata).await {
-                    warn!("ptp: general send failed: {}", error);
-                }
-            }
-            PortAction::ResetAnnounceTimer { duration } => {
-                timers.announce = Some(deadline_from_now(duration));
-            }
-            PortAction::ResetSyncTimer { duration } => {
-                timers.sync = Some(deadline_from_now(duration));
-            }
-            PortAction::ResetDelayRequestTimer { duration } => {
-                timers.delay_request = Some(deadline_from_now(duration));
-            }
-            PortAction::ResetAnnounceReceiptTimer { duration } => {
-                timers.announce_receipt = Some(deadline_from_now(duration));
-            }
-            PortAction::ResetFilterUpdateTimer { duration } => {
-                timers.filter_update = Some(deadline_from_now(duration));
-            }
-            PortAction::ForwardTLV { .. } => {}
+struct PortIo<'a> {
+    event: UdpSocket<'a>,
+    general: UdpSocket<'a>,
+    timers: Timers,
+    packet_id: PacketIdGenerator,
+    pending_tx: PendingTxQueue,
+}
+
+impl<'a> PortIo<'a> {
+    fn new(
+        mut event: UdpSocket<'a>,
+        mut general: UdpSocket<'a>,
+        tx_timestamp_timeout: EmbassyDuration,
+    ) -> Self {
+        event.bind(EVENT_PORT).unwrap();
+        general.bind(GENERAL_PORT).unwrap();
+        Self {
+            event,
+            general,
+            timers: Timers::default(),
+            packet_id: PacketIdGenerator::new(),
+            pending_tx: PendingTxQueue::new(tx_timestamp_timeout),
         }
     }
+
+    async fn handle(&mut self, actions: PortActionIterator<'_>) {
+        for action in actions {
+            match action {
+                PortAction::SendEvent {
+                    context,
+                    data,
+                    link_local,
+                } => {
+                    let metadata = UdpMetadata {
+                        endpoint: multicast_endpoint(EVENT_PORT, link_local),
+                        meta: self.packet_id.next(),
+                        local_address: None,
+                    };
+                    match self.event.send_to(data, metadata).await {
+                        Ok(()) => self.pending_tx.push(context, metadata.meta.id),
+                        Err(error) => warn!("ptp: event send failed: {}", &error),
+                    }
+                }
+                PortAction::SendGeneral { data, link_local } => {
+                    let metadata = UdpMetadata {
+                        endpoint: multicast_endpoint(GENERAL_PORT, link_local),
+                        meta: udp::PacketMeta::default(),
+                        local_address: None,
+                    };
+                    if let Err(error) = self.general.send_to(data, metadata).await {
+                        warn!("ptp: general send failed: {}", error);
+                    }
+                }
+                PortAction::ResetAnnounceTimer { duration } => {
+                    self.timers.reset(StatimeTimer::Announce, duration)
+                }
+                PortAction::ResetSyncTimer { duration } => {
+                    self.timers.reset(StatimeTimer::Sync, duration)
+                }
+                PortAction::ResetDelayRequestTimer { duration } => {
+                    self.timers.reset(StatimeTimer::DelayRequest, duration)
+                }
+                PortAction::ResetAnnounceReceiptTimer { duration } => {
+                    self.timers.reset(StatimeTimer::AnnounceReceipt, duration)
+                }
+                PortAction::ResetFilterUpdateTimer { duration } => {
+                    self.timers.reset(StatimeTimer::FilterUpdate, duration)
+                }
+                PortAction::ForwardTLV { .. } => {}
+            }
+        }
+    }
+
+    fn receive<'b>(&self, packet: &'b mut [u8]) -> Incoming<'b> {
+        match self.event.try_recv_from(packet) {
+            Ok((n, meta)) => {
+                let packet = &packet[..n];
+                return rx_event_timestamp(packet, meta.meta).map_or(Incoming::None, |timestamp| {
+                    Incoming::Event(packet, timestamp)
+                });
+            }
+            Err(TryError::Other(udp::RecvError::Truncated)) => {
+                warn!("ptp: truncated event packet");
+                return Incoming::None;
+            }
+            Err(TryError::WouldBlock) => {}
+        }
+
+        match self.general.try_recv_from(packet) {
+            Ok((n, _)) if ptp_message_type(&packet[..n]).is_some() => {
+                Incoming::General(&packet[..n])
+            }
+            Ok(_) | Err(TryError::WouldBlock) => Incoming::None,
+            Err(TryError::Other(udp::RecvError::Truncated)) => {
+                warn!("ptp: truncated general packet");
+                Incoming::None
+            }
+        }
+    }
+
+    fn next_deadline(&self, deadline: Instant) -> Instant {
+        [
+            self.timers.next_deadline(),
+            self.pending_tx.next_timeout_deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .fold(deadline, Ord::min)
+    }
+
+    async fn wait(&self, stack: Stack<'_>, deadline: Instant) -> Option<TxTimestamp> {
+        match with_deadline(
+            deadline,
+            select3(
+                stack.poll_tx_timestamps(),
+                self.event.wait_recv_ready(),
+                self.general.wait_recv_ready(),
+            ),
+        )
+        .await
+        {
+            Ok(Either3::First(timestamp)) => Some(timestamp),
+            _ => None,
+        }
+    }
+}
+
+enum Incoming<'a> {
+    Event(&'a [u8], Timestamp),
+    General(&'a [u8]),
+    None,
 }
 
 fn rx_event_timestamp(packet: &[u8], meta: udp::PacketMeta) -> Option<Timestamp> {
@@ -420,49 +427,28 @@ fn ptp_message_type(packet: &[u8]) -> Option<u8> {
 }
 
 #[derive(Default)]
-struct Timers {
-    announce: Option<Instant>,
-    sync: Option<Instant>,
-    delay_request: Option<Instant>,
-    announce_receipt: Option<Instant>,
-    filter_update: Option<Instant>,
-}
+struct Timers([Option<Instant>; StatimeTimer::ALL.len()]);
 
 impl Timers {
+    fn reset(&mut self, timer: StatimeTimer, duration: core::time::Duration) {
+        self.0[timer as usize] = Some(deadline_from_now(duration));
+    }
+
     fn take_due(&mut self) -> Option<StatimeTimer> {
         let now = Instant::now();
-        [
-            (StatimeTimer::Announce, &mut self.announce),
-            (StatimeTimer::Sync, &mut self.sync),
-            (StatimeTimer::DelayRequest, &mut self.delay_request),
-            (StatimeTimer::AnnounceReceipt, &mut self.announce_receipt),
-            (StatimeTimer::FilterUpdate, &mut self.filter_update),
-        ]
-        .into_iter()
-        .find_map(|(timer, deadline)| {
-            if deadline.is_some_and(|at| now >= at) {
-                *deadline = None;
-                Some(timer)
-            } else {
-                None
-            }
+        StatimeTimer::ALL.into_iter().find(|&timer| {
+            self.0[timer as usize]
+                .take_if(|deadline| now >= *deadline)
+                .is_some()
         })
     }
 
     fn next_deadline(&self) -> Option<Instant> {
-        [
-            self.announce,
-            self.sync,
-            self.delay_request,
-            self.announce_receipt,
-            self.filter_update,
-        ]
-        .into_iter()
-        .flatten()
-        .reduce(Ord::min)
+        self.0.into_iter().flatten().min()
     }
 }
 
+#[repr(usize)]
 #[derive(Clone, Copy)]
 enum StatimeTimer {
     Announce,
@@ -470,6 +456,16 @@ enum StatimeTimer {
     DelayRequest,
     AnnounceReceipt,
     FilterUpdate,
+}
+
+impl StatimeTimer {
+    const ALL: [Self; 5] = [
+        Self::Announce,
+        Self::Sync,
+        Self::DelayRequest,
+        Self::AnnounceReceipt,
+        Self::FilterUpdate,
+    ];
 }
 
 struct PendingTx {
@@ -491,40 +487,33 @@ impl PendingTxQueue {
         }
     }
 
-    fn push(&mut self, context: TimestampContext, meta: udp::PacketMeta) {
+    fn push(&mut self, context: TimestampContext, packet_id: u32) {
         if let Some(slot) = self.slots.iter_mut().find(|slot| slot.is_none()) {
             *slot = Some(PendingTx {
                 context,
-                packet_id: meta.id,
+                packet_id,
                 started: Instant::now(),
             });
         } else {
-            warn!("ptp: tx timestamp queue full packet_id={=u32}", meta.id);
+            warn!("ptp: tx timestamp queue full packet_id={=u32}", packet_id);
         }
     }
 
     fn take(&mut self, packet_id: u32) -> Option<TimestampContext> {
-        for slot in self.slots.iter_mut() {
-            if slot
-                .as_ref()
-                .is_some_and(|pending| pending.packet_id == packet_id)
-            {
-                return slot.take().map(|pending| pending.context);
-            }
-        }
-        None
+        self.slots
+            .iter_mut()
+            .find_map(|slot| slot.take_if(|pending| pending.packet_id == packet_id))
+            .map(|pending| pending.context)
     }
 
     fn expire(&mut self) {
         for slot in self.slots.iter_mut() {
-            if let Some(pending) = slot
-                && pending.started.elapsed() >= self.timeout
+            if let Some(pending) = slot.take_if(|pending| pending.started.elapsed() >= self.timeout)
             {
                 warn!(
                     "ptp: missing tx timestamp packet_id={=u32}",
                     pending.packet_id
                 );
-                *slot = None;
             }
         }
     }
@@ -532,11 +521,8 @@ impl PendingTxQueue {
     fn next_timeout_deadline(&self) -> Option<Instant> {
         self.slots
             .iter()
-            .filter_map(|slot| {
-                let pending = slot.as_ref()?;
-                Some(pending.started + self.timeout)
-            })
-            .reduce(Ord::min)
+            .filter_map(|slot| slot.as_ref().map(|pending| pending.started + self.timeout))
+            .min()
     }
 }
 
